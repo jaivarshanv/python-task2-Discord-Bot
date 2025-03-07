@@ -2,21 +2,23 @@ import discord
 import os
 import sys
 import asyncio
-import re  # For manual time extraction fallback
+import re  # For regex extraction fallback
 import google.generativeai as genai
 import google.api_core.exceptions
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta
 import pytz
 import dateparser
+from dateparser.search import search_dates  # To extract dates from text
 
 # Reconfigure stdout to use UTF-8 so emojis print correctly
 if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
 # Load API keys (replace with your actual keys)
-DISCORD_BOT_TOKEN = ""
+DISCORD_BOT_TOKEN = ""#enter your own credential
 GEMINI_API_KEY = ""
+
 
 # Configure the Gemini API via the google.generativeai library
 genai.configure(api_key=GEMINI_API_KEY)
@@ -72,42 +74,69 @@ async def send_response(channel, response):
     for i in range(0, len(response), 2000):
         await channel.send(response[i:i+2000])
 
-# ----- Chat Command -----
+# ----- Chat Command (with natural language reminder support) -----
 @bot.command()
 async def chat(ctx, *, message: str):
     """
-    Chat with the Gemini API or set a reminder using natural language.
-    If the message starts with "set reminder", it is interpreted as a reminder command.
+    If the message starts with "set reminder", the bot interprets it as a natural language reminder command.
+    It first checks for an explicit "on ... at ..." pattern to extract day, date, and time.
+    Otherwise, it uses search_dates with a proper RELATIVE_BASE to determine the intended reminder time.
+    If no valid datetime is found, it returns an error.
+    Otherwise, it sets the reminder.
+    If the message does not start with "set reminder", it sends the message to the Gemini API.
     """
-    if message.lower().startswith("set reminder"):
-        # Remove "set reminder" prefix and strip extra whitespace
-        reminder_text = message[len("set reminder"):].strip()
-        # Get user's timezone (default is "UTC")
+    trigger = "set reminder"
+    if message.lower().startswith(trigger):
+        # Remove trigger phrase
+        reminder_text = message[len(trigger):].strip()
+        # Get the user's timezone (default "UTC")
         user_tz = user_timezones.get(ctx.author.id, "UTC")
-        # Try natural language parsing with dateparser
-        reminder_datetime = dateparser.parse(
-            reminder_text,
-            settings={
-                'TIMEZONE': user_tz,
-                'RETURN_AS_TIMEZONE_AWARE': True,
-                'PREFER_DATES_FROM': 'future'
-            }
-        )
-        # Fallback: manual extraction for "in X minutes" or "in X hours"
+        relative_base = datetime.now(pytz.timezone(user_tz))
+        reminder_datetime = None
+
+        # First, check for an explicit "on ... at ..." pattern.
+        # Example: "remind me to call SK on Friday, March 10 at 3:50 pm"
+        explicit_match = re.search(r'on\s+(.+?)\s+at\s+(.+)', reminder_text, re.IGNORECASE)
+        if explicit_match:
+            date_part = explicit_match.group(1)
+            time_part = explicit_match.group(2)
+            combined = f"{date_part} {time_part}"
+            reminder_datetime = dateparser.parse(
+                combined,
+                settings={
+                    'TIMEZONE': user_tz,
+                    'RETURN_AS_TIMEZONE_AWARE': True,
+                    'PREFER_DATES_FROM': 'future',
+                    'RELATIVE_BASE': relative_base
+                }
+            )
+        # If no explicit pattern was found or parsing failed, try search_dates over the whole text.
+        if reminder_datetime is None:
+            results = search_dates(
+                reminder_text,
+                settings={
+                    'TIMEZONE': user_tz,
+                    'RETURN_AS_TIMEZONE_AWARE': True,
+                    'PREFER_DATES_FROM': 'future',
+                    'RELATIVE_BASE': relative_base
+                }
+            )
+            if results:
+                # Use the last extracted datetime as the intended reminder time.
+                reminder_datetime = results[-1][1]
+        # Fallback: try manual extraction for "in X minutes" or "in X hours"
         if reminder_datetime is None:
             match = re.search(r'in\s+(\d+)\s+minutes?', reminder_text, re.IGNORECASE)
             if match:
                 minutes = int(match.group(1))
                 reminder_datetime = datetime.now(pytz.timezone(user_tz)) + timedelta(minutes=minutes)
-                reminder_datetime = pytz.timezone(user_tz).localize(reminder_datetime.replace(tzinfo=None))
             else:
                 match = re.search(r'in\s+(\d+)\s+hours?', reminder_text, re.IGNORECASE)
                 if match:
                     hours = int(match.group(1))
                     reminder_datetime = datetime.now(pytz.timezone(user_tz)) + timedelta(hours=hours)
-                    reminder_datetime = pytz.timezone(user_tz).localize(reminder_datetime.replace(tzinfo=None))
         if reminder_datetime is None:
-            await ctx.send("⚠️ Could not determine a valid time from your reminder text. Please include a clear time reference (e.g., 'in 20 minutes' or 'at 3pm').")
+            await ctx.send("⚠️ Could not determine a valid time from your reminder text. Please include a clear time reference (e.g., 'in 20 minutes', 'at 3pm', or 'tomorrow at 3:50 pm').")
             return
         user_id = ctx.author.id
         if user_id not in reminders:
@@ -148,11 +177,9 @@ async def on_member_join(member):
 async def on_message(message):
     if message.author == bot.user:
         return
-    # Process commands if the message starts with "!"
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
-    # Auto-respond with AI if user's AI mode is enabled
     if user_ai_mode.get(message.author.id, False):
         ai_reply = get_gemini_response(message.content)
         await send_response(message.channel, ai_reply)
@@ -184,7 +211,7 @@ async def settimezone(ctx, tz: str):
     except pytz.UnknownTimeZoneError:
         await ctx.send("⚠️ Invalid timezone. Please use a valid timezone name (e.g., `UTC`, `America/New_York`, `Asia/Kolkata`).")
 
-# ----- Reminder Command (Strict Format) -----
+# ----- Strict Reminder Command -----
 @bot.command()
 async def remind(ctx, time: str, *, message: str):
     """
