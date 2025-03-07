@@ -15,8 +15,8 @@ if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
 # Load API keys (replace with your actual keys)
-DISCORD_BOT_TOKEN = "MTM0NzUyNTk2MDQzMzY2ODE3OQ.GwJw-l.WBOFeBLtPN2uKPlVFDV27yde3bf5cjS5eoknOM"
-GEMINI_API_KEY = "AIzaSyBkeDJpNVBhsoecWKFnra9cOUKpTBiGoWA"
+DISCORD_BOT_TOKEN = ""
+GEMINI_API_KEY = ""
 
 # Configure the Gemini API via the google.generativeai library
 genai.configure(api_key=GEMINI_API_KEY)
