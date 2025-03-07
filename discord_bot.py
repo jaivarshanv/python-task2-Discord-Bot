@@ -2,7 +2,7 @@ import discord
 import os
 import sys
 import asyncio
-import re  # For regex extraction fallback
+import re
 import google.generativeai as genai
 import google.api_core.exceptions
 from discord.ext import commands, tasks
@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import pytz
 import dateparser
 from dateparser.search import search_dates
+import yt_dlp  # For YouTube searching and extraction
 
 # Reconfigure stdout to use UTF-8 so emojis print correctly
 if sys.stdout.encoding.lower() != 'utf-8':
@@ -19,9 +20,9 @@ if sys.stdout.encoding.lower() != 'utf-8':
 DISCORD_BOT_TOKEN = ""
 GEMINI_API_KEY = ""
 
+
 # Configure the Gemini API via the google.generativeai library
 genai.configure(api_key=GEMINI_API_KEY)
-# Initialize the model (adjust the model name if needed)
 model = genai.GenerativeModel("gemini-1.5-pro-latest")
 
 # Set up the Discord bot with required intents
@@ -29,15 +30,53 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Global conversation history per channel (keep last N messages)
-conversation_history = {}  # { channel_id: list of messages }
-HISTORY_LIMIT = 6  # Adjust number of messages to include in context
+# Global conversation history per channel (for context memory)
+conversation_history = {}  # { channel_id: list of strings }
+HISTORY_LIMIT = 6
 
-# Dictionaries for storing user time zones and reminders
+# Dictionaries for storing user time zones, reminders, and individual AI mode preferences
 user_timezones = {}     # { user_id: timezone_str }
 reminders = {}          # { user_id: list of tuples (reminder_datetime, message) }
-# For auto-AI mode per user (optional)
 user_ai_mode = {}       # { user_id: bool }
+
+# Dictionary to hold music queues for each guild (server)
+music_queues = {}  # { guild_id: list of song URLs }
+
+# ----- Helper Functions -----
+def get_gemini_response(prompt):
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except google.api_core.exceptions.ResourceExhausted:
+        return "🚫 I'm out of quota! Please try again later."
+    except Exception as e:
+        return f"⚠️ Oops! Something went wrong: {str(e)}"
+
+async def send_response(channel, response):
+    for i in range(0, len(response), 2000):
+        await channel.send(response[i:i+2000])
+
+def update_history(channel_id, role, content):
+    if channel_id not in conversation_history:
+        conversation_history[channel_id] = []
+    conversation_history[channel_id].append(f"{role}: {content}")
+    if len(conversation_history[channel_id]) > HISTORY_LIMIT:
+        conversation_history[channel_id] = conversation_history[channel_id][-HISTORY_LIMIT:]
+
+def search_youtube(query):
+    ydl_opts = {
+        'format': 'bestaudio',
+        'noplaylist': True,
+        'quiet': True
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(f"ytsearch:{query}", download=False)['entries'][0]
+            # Return a direct audio URL using yt_dlp
+            return info['url']
+        except Exception as e:
+            print(f"Error searching YouTube: {e}")
+            return None
 
 # ----- Admin Commands -----
 @bot.command()
@@ -58,55 +97,137 @@ async def stop(ctx):
     else:
         await ctx.send("❌ You don't have permission to stop the bot.")
 
-# ----- Active Chat Commands -----
+# ----- Active Chat Test Command -----
 @bot.command()
 async def hello(ctx):
     await ctx.send("Hello, world! 👋")
 
-# ----- Gemini API Integration -----
-def get_gemini_response(prompt):
-    try:
-        response = model.generate_content(prompt)
-        return response.text
-    except google.api_core.exceptions.ResourceExhausted:
-        return "🚫 I'm out of quota! Please try again later."
-    except Exception as e:
-        return f"⚠️ Oops! Something went wrong: {str(e)}"
+# ----- Music Commands -----
+@bot.command()
+async def play(ctx, *, query: str):
+    """
+    Play a song. If query is a URL, play it directly.
+    Otherwise, search YouTube for the query and play the first result.
+    """
+    if not ctx.author.voice:
+        await ctx.send("You must be in a voice channel to play music.")
+        return
 
-# Function to safely send long responses
-async def send_response(channel, response):
-    for i in range(0, len(response), 2000):
-        await channel.send(response[i:i+2000])
+    voice_channel = ctx.author.voice.channel
+    guild_id = ctx.guild.id
+    voice_client = ctx.guild.voice_client
 
-# Helper to update conversation history (store up to HISTORY_LIMIT messages)
-def update_history(channel_id, role, content):
-    if channel_id not in conversation_history:
-        conversation_history[channel_id] = []
-    conversation_history[channel_id].append(f"{role}: {content}")
-    if len(conversation_history[channel_id]) > HISTORY_LIMIT:
-        conversation_history[channel_id] = conversation_history[channel_id][-HISTORY_LIMIT:]
+    if voice_client is None:
+        voice_client = await voice_channel.connect()
+        await ctx.send("Connected to the voice channel.")
+    elif voice_client.channel != voice_channel:
+        await voice_client.move_to(voice_channel)
+        await ctx.send("Moved to your voice channel.")
 
-# ----- on_message: Context-Aware Chat and Natural Language Reminders -----
+    # Determine if the query is a URL
+    if not re.match(r'https?://', query):
+        await ctx.send("Searching YouTube for your song...")
+        url = search_youtube(query)
+        if url is None:
+            await ctx.send("⚠️ Could not find a matching video on YouTube.")
+            return
+    else:
+        url = query
+
+    if guild_id not in music_queues:
+        music_queues[guild_id] = []
+    music_queues[guild_id].append(url)
+    await ctx.send(f"Added to queue: {url}")
+
+    if not voice_client.is_playing():
+        await play_next_song(ctx, voice_client)
+
+async def play_next_song(ctx, voice_client):
+    guild_id = ctx.guild.id
+    if guild_id in music_queues and music_queues[guild_id]:
+        next_song = music_queues[guild_id].pop(0)
+        # Use FFmpeg with reconnect options for streaming stability.
+        ffmpeg_options = {
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            'options': '-vn'
+        }
+        source = discord.FFmpegPCMAudio(next_song, **ffmpeg_options)
+        def after_playing(error):
+            if error:
+                print(f"Error playing audio: {error}")
+            fut = asyncio.run_coroutine_threadsafe(play_next_song(ctx, voice_client), bot.loop)
+            try:
+                fut.result()
+            except Exception as e:
+                print(f"Error in after callback: {e}")
+        voice_client.play(source, after=after_playing)
+        await ctx.send(f"Now playing: {next_song}")
+    else:
+        await ctx.send("The music queue is empty.")
+
+@bot.command()
+async def skip(ctx):
+    voice_client = ctx.guild.voice_client
+    if voice_client and voice_client.is_playing():
+        voice_client.stop()
+        await ctx.send("Skipped the current song.")
+    else:
+        await ctx.send("No song is currently playing.")
+
+@bot.command()
+async def queue(ctx):
+    guild_id = ctx.guild.id
+    if guild_id in music_queues and music_queues[guild_id]:
+        queue_list = "\n".join([f"{i+1}. {song}" for i, song in enumerate(music_queues[guild_id])])
+        await ctx.send(f"Music Queue:\n{queue_list}")
+    else:
+        await ctx.send("The music queue is empty.")
+
+# ----- on_message: Active Chat, Context Memory, and Task Processing -----
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
 
-    # Process commands if message starts with the command prefix
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
 
+    content = message.content.strip()
     channel_id = message.channel.id
 
-    # Check if this message is a natural language reminder command
-    if message.content.lower().startswith("set reminder"):
-        reminder_text = message.content[len("set reminder"):].strip()
+    # Natural Language Poll Creation
+    if content.lower().startswith("create poll:"):
+        pattern = re.compile(r"create poll:\s*(.*?)\s*options:\s*(.*)", re.IGNORECASE)
+        match = pattern.search(content)
+        if match:
+            question = match.group(1).strip()
+            options_str = match.group(2).strip()
+            options = [opt.strip() for opt in re.split(r",|;", options_str) if opt.strip()]
+            if len(options) < 2:
+                await message.channel.send("⚠️ Please provide at least two options separated by commas or semicolons.")
+                return
+            embed = discord.Embed(title="📊 Poll", description=question, color=discord.Color.blue())
+            number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+            poll_text = ""
+            for i, option in enumerate(options):
+                poll_text += f"{number_emojis[i]} {option}\n"
+            embed.add_field(name="Options", value=poll_text, inline=False)
+            embed.set_footer(text="React with an emoji to vote!")
+            poll_message = await message.channel.send(embed=embed)
+            for i in range(len(options)):
+                await poll_message.add_reaction(number_emojis[i])
+            update_history(channel_id, "User", content)
+            update_history(channel_id, "Bot", f"Created poll: {question}")
+            return
+
+    # Natural Language Reminder Processing
+    if content.lower().startswith("set reminder"):
+        reminder_text = content[len("set reminder"):].strip()
         user_tz = user_timezones.get(message.author.id, "UTC")
         relative_base = datetime.now(pytz.timezone(user_tz))
         reminder_datetime = None
 
-        # Check for an explicit "on ... at ..." pattern
         explicit_match = re.search(r'on\s+(.+?)\s+at\s+(.+)', reminder_text, re.IGNORECASE)
         if explicit_match:
             date_part = explicit_match.group(1)
@@ -121,7 +242,6 @@ async def on_message(message):
                     'RELATIVE_BASE': relative_base
                 }
             )
-        # Otherwise, use search_dates over the text
         if reminder_datetime is None:
             results = search_dates(
                 reminder_text,
@@ -134,7 +254,6 @@ async def on_message(message):
             )
             if results:
                 reminder_datetime = results[-1][1]
-        # Fallback: manual extraction
         if reminder_datetime is None:
             match = re.search(r'in\s+(\d+)\s+minutes?', reminder_text, re.IGNORECASE)
             if match:
@@ -148,59 +267,29 @@ async def on_message(message):
         if reminder_datetime is None:
             await message.channel.send("⚠️ Could not determine a valid time from your reminder text. Please include a clear time reference (e.g., 'in 20 minutes', 'at 3pm', or 'tomorrow at 3:50 pm').")
             return
-
         user_id = message.author.id
         if user_id not in reminders:
             reminders[user_id] = []
         reminders[user_id].append((reminder_datetime, reminder_text))
         await message.channel.send(f"⏰ Reminder set for {reminder_datetime.strftime('%Y-%m-%d %H:%M %Z')} with message: {reminder_text}")
-        # Optionally update conversation history as context
-        update_history(channel_id, "User", message.content)
+        update_history(channel_id, "User", content)
         update_history(channel_id, "Bot", f"Set reminder for {reminder_datetime.strftime('%Y-%m-%d %H:%M %Z')}")
-    else:
-        # Build context prompt from conversation history (if any)
-        history = conversation_history.get(channel_id, [])
-        prompt = "\n".join(history[-HISTORY_LIMIT:]) + f"\nUser: {message.content}\nBot:"
-        ai_reply = get_gemini_response(prompt)
-        await send_response(message.channel, ai_reply)
-        # Update conversation history with both user and bot messages
-        update_history(channel_id, "User", message.content)
-        update_history(channel_id, "Bot", ai_reply)
-
-# ----- Poll Command -----
-@bot.command()
-async def poll(ctx, question: str, *options: str):
-    if len(options) < 2 or len(options) > 10:
-        await ctx.send("Poll must have between 2 and 10 options!")
         return
-    embed = discord.Embed(title="📊 Poll", description=question, color=discord.Color.blue())
-    number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-    poll_text = ""
-    for i, option in enumerate(options):
-        poll_text += f"{number_emojis[i]} {option}\n"
-    embed.add_field(name="Options", value=poll_text, inline=False)
-    embed.set_footer(text="React with an emoji to vote!")
-    poll_message = await ctx.send(embed=embed)
-    for i in range(len(options)):
-        await poll_message.add_reaction(number_emojis[i])
 
-# ----- Time Zone Command -----
-@bot.command()
-async def settimezone(ctx, tz: str):
-    try:
-        pytz.timezone(tz)
-        user_timezones[ctx.author.id] = tz
-        await ctx.send(f"🌍 Timezone set to `{tz}`.")
-    except pytz.UnknownTimeZoneError:
-        await ctx.send("⚠️ Invalid timezone. Please use a valid timezone name (e.g., `UTC`, `America/New_York`, `Asia/Kolkata`).")
+    # Otherwise, process as a regular chat message with context
+    history = conversation_history.get(channel_id, [])
+    prompt = "\n".join(history[-HISTORY_LIMIT:]) + f"\nUser: {content}\nBot:"
+    lc_content = content.lower()
+    if "elaborate" not in lc_content and "summarise" not in lc_content:
+        prompt = "Respond briefly: " + prompt
+    ai_reply = get_gemini_response(prompt)
+    await send_response(message.channel, ai_reply)
+    update_history(channel_id, "User", content)
+    update_history(channel_id, "Bot", ai_reply)
 
 # ----- Strict Reminder Command -----
 @bot.command()
 async def remind(ctx, time: str, *, message: str):
-    """
-    Set a reminder using a strict format: !remind HH:MM <message>
-    If the time has passed today, the reminder is set for the next day.
-    """
     user_id = ctx.author.id
     user_tz = user_timezones.get(user_id, "UTC")
     try:
@@ -220,10 +309,6 @@ async def remind(ctx, time: str, *, message: str):
 # ----- Interactive Delete Reminder Command -----
 @bot.command()
 async def delreminder(ctx, index: int = None):
-    """
-    Delete a reminder. If an index is provided, delete that specific reminder.
-    If no index is provided, list all reminders and let the user choose which one to delete.
-    """
     user_id = ctx.author.id
     if user_id not in reminders or not reminders[user_id]:
         await ctx.send("⚠️ You don't have any active reminders.")
