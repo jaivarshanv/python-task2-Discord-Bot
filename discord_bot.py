@@ -9,16 +9,15 @@ from discord.ext import commands, tasks
 from datetime import datetime, timedelta
 import pytz
 import dateparser
-from dateparser.search import search_dates  # To extract dates from text
+from dateparser.search import search_dates
 
 # Reconfigure stdout to use UTF-8 so emojis print correctly
 if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
 # Load API keys (replace with your actual keys)
-DISCORD_BOT_TOKEN = ""#enter your own credential
+DISCORD_BOT_TOKEN = ""#enter your own keys
 GEMINI_API_KEY = ""
-
 
 # Configure the Gemini API via the google.generativeai library
 genai.configure(api_key=GEMINI_API_KEY)
@@ -89,13 +88,11 @@ async def chat(ctx, *, message: str):
     if message.lower().startswith(trigger):
         # Remove trigger phrase
         reminder_text = message[len(trigger):].strip()
-        # Get the user's timezone (default "UTC")
         user_tz = user_timezones.get(ctx.author.id, "UTC")
         relative_base = datetime.now(pytz.timezone(user_tz))
         reminder_datetime = None
 
-        # First, check for an explicit "on ... at ..." pattern.
-        # Example: "remind me to call SK on Friday, March 10 at 3:50 pm"
+        # Check for an explicit "on ... at ..." pattern.
         explicit_match = re.search(r'on\s+(.+?)\s+at\s+(.+)', reminder_text, re.IGNORECASE)
         if explicit_match:
             date_part = explicit_match.group(1)
@@ -110,7 +107,7 @@ async def chat(ctx, *, message: str):
                     'RELATIVE_BASE': relative_base
                 }
             )
-        # If no explicit pattern was found or parsing failed, try search_dates over the whole text.
+        # If no explicit pattern, use search_dates.
         if reminder_datetime is None:
             results = search_dates(
                 reminder_text,
@@ -122,9 +119,8 @@ async def chat(ctx, *, message: str):
                 }
             )
             if results:
-                # Use the last extracted datetime as the intended reminder time.
                 reminder_datetime = results[-1][1]
-        # Fallback: try manual extraction for "in X minutes" or "in X hours"
+        # Fallback: manual extraction for "in X minutes/hours"
         if reminder_datetime is None:
             match = re.search(r'in\s+(\d+)\s+minutes?', reminder_text, re.IGNORECASE)
             if match:
@@ -234,15 +230,49 @@ async def remind(ctx, time: str, *, message: str):
     except ValueError:
         await ctx.send("⚠️ Invalid time format! Use HH:MM (24-hour format).")
 
-# ----- Delete Reminder Command -----
+# ----- Interactive Delete Reminder Command -----
 @bot.command()
-async def delreminder(ctx):
+async def delreminder(ctx, index: int = None):
+    """
+    Deletes a reminder. If an index is provided, deletes that specific reminder.
+    If no index is provided, lists all reminders and asks the user to choose one.
+    """
     user_id = ctx.author.id
-    if user_id in reminders and reminders[user_id]:
-        del reminders[user_id]
-        await ctx.send("🗑️ Your reminders have been deleted.")
-    else:
+    if user_id not in reminders or not reminders[user_id]:
         await ctx.send("⚠️ You don't have any active reminders.")
+        return
+
+    user_reminders = reminders[user_id]
+    # If index is provided and valid, delete that reminder.
+    if index is not None:
+        if 1 <= index <= len(user_reminders):
+            removed = user_reminders.pop(index - 1)
+            await ctx.send(f"🗑️ Deleted reminder set for {removed[0].strftime('%Y-%m-%d %H:%M %Z')} - {removed[1]}")
+        else:
+            await ctx.send("⚠️ Invalid index. Please provide a valid reminder number.")
+        return
+
+    # Otherwise, list reminders and ask for a choice.
+    response = "Please reply with the number of the reminder you want to delete:\n"
+    for i, (rem_time, msg) in enumerate(user_reminders, start=1):
+        response += f"{i}. {rem_time.strftime('%Y-%m-%d %H:%M %Z')} - {msg}\n"
+    await ctx.send(response)
+
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+
+    try:
+        reply = await bot.wait_for("message", timeout=30.0, check=check)
+        choice = int(reply.content)
+        if 1 <= choice <= len(user_reminders):
+            removed = user_reminders.pop(choice - 1)
+            await ctx.send(f"🗑️ Deleted reminder set for {removed[0].strftime('%Y-%m-%d %H:%M %Z')} - {removed[1]}")
+        else:
+            await ctx.send("⚠️ Invalid number. No reminder deleted.")
+    except asyncio.TimeoutError:
+        await ctx.send("⏰ Timeout: No response received. No reminder deleted.")
+    except ValueError:
+        await ctx.send("⚠️ Please enter a valid number.")
 
 # ----- Background Task: Check Reminders -----
 @tasks.loop(seconds=10)
