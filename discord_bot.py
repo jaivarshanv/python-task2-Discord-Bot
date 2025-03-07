@@ -2,19 +2,21 @@ import discord
 import os
 import sys
 import asyncio
+import re  # For manual time extraction fallback
 import google.generativeai as genai
 import google.api_core.exceptions
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta
 import pytz
 import dateparser
+
 # Reconfigure stdout to use UTF-8 so emojis print correctly
 if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
 # Load API keys (replace with your actual keys)
-DISCORD_BOT_TOKEN = ""
-GEMINI_API_KEY = ""
+DISCORD_BOT_TOKEN = "MTM0NzUyNTk2MDQzMzY2ODE3OQ.GwJw-l.WBOFeBLtPN2uKPlVFDV27yde3bf5cjS5eoknOM"
+GEMINI_API_KEY = "AIzaSyBkeDJpNVBhsoecWKFnra9cOUKpTBiGoWA"
 
 # Configure the Gemini API via the google.generativeai library
 genai.configure(api_key=GEMINI_API_KEY)
@@ -28,8 +30,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Dictionaries for storing user time zones, reminders, and AI mode preferences
 user_timezones = {}     # { user_id: timezone_str }
-reminders = {}          # { user_id: (reminder_datetime, message) }
-user_ai_mode = {}       # { user_id: bool }  True means auto-AI response enabled
+reminders = {}          # { user_id: list of tuples (reminder_datetime, message) }
+user_ai_mode = {}       # { user_id: bool }  (True means auto-AI response enabled)
 
 # ----- Admin Commands -----
 @bot.command()
@@ -73,9 +75,48 @@ async def send_response(channel, response):
 # ----- Chat Command -----
 @bot.command()
 async def chat(ctx, *, message: str):
-    """Chat with the Gemini API."""
-    ai_reply = get_gemini_response(message)
-    await send_response(ctx.channel, ai_reply)
+    """
+    Chat with the Gemini API or set a reminder using natural language.
+    If the message starts with "set reminder", it is interpreted as a reminder command.
+    """
+    if message.lower().startswith("set reminder"):
+        # Remove "set reminder" prefix and strip extra whitespace
+        reminder_text = message[len("set reminder"):].strip()
+        # Get user's timezone (default is "UTC")
+        user_tz = user_timezones.get(ctx.author.id, "UTC")
+        # Try natural language parsing with dateparser
+        reminder_datetime = dateparser.parse(
+            reminder_text,
+            settings={
+                'TIMEZONE': user_tz,
+                'RETURN_AS_TIMEZONE_AWARE': True,
+                'PREFER_DATES_FROM': 'future'
+            }
+        )
+        # Fallback: manual extraction for "in X minutes" or "in X hours"
+        if reminder_datetime is None:
+            match = re.search(r'in\s+(\d+)\s+minutes?', reminder_text, re.IGNORECASE)
+            if match:
+                minutes = int(match.group(1))
+                reminder_datetime = datetime.now(pytz.timezone(user_tz)) + timedelta(minutes=minutes)
+                reminder_datetime = pytz.timezone(user_tz).localize(reminder_datetime.replace(tzinfo=None))
+            else:
+                match = re.search(r'in\s+(\d+)\s+hours?', reminder_text, re.IGNORECASE)
+                if match:
+                    hours = int(match.group(1))
+                    reminder_datetime = datetime.now(pytz.timezone(user_tz)) + timedelta(hours=hours)
+                    reminder_datetime = pytz.timezone(user_tz).localize(reminder_datetime.replace(tzinfo=None))
+        if reminder_datetime is None:
+            await ctx.send("⚠️ Could not determine a valid time from your reminder text. Please include a clear time reference (e.g., 'in 20 minutes' or 'at 3pm').")
+            return
+        user_id = ctx.author.id
+        if user_id not in reminders:
+            reminders[user_id] = []
+        reminders[user_id].append((reminder_datetime, reminder_text))
+        await ctx.send(f"⏰ Reminder set for {reminder_datetime.strftime('%Y-%m-%d %H:%M %Z')} with message: {reminder_text}")
+    else:
+        ai_reply = get_gemini_response(message)
+        await send_response(ctx.channel, ai_reply)
 
 # ----- Mode Command (AI vs Normal) -----
 @bot.command()
@@ -107,11 +148,11 @@ async def on_member_join(member):
 async def on_message(message):
     if message.author == bot.user:
         return
-    # Process commands if message starts with the command prefix
+    # Process commands if the message starts with "!"
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
-    # Auto-respond with AI if user AI mode is enabled
+    # Auto-respond with AI if user's AI mode is enabled
     if user_ai_mode.get(message.author.id, False):
         ai_reply = get_gemini_response(message.content)
         await send_response(message.channel, ai_reply)
@@ -159,39 +200,20 @@ async def remind(ctx, time: str, *, message: str):
         reminder_datetime = user_timezone.localize(datetime.combine(now.date(), reminder_time))
         if reminder_datetime < now:
             reminder_datetime += timedelta(days=1)
-        reminders[user_id] = (reminder_datetime, message)
+        if user_id not in reminders:
+            reminders[user_id] = []
+        reminders[user_id].append((reminder_datetime, message))
         await ctx.send(f"⏰ Reminder set for {reminder_datetime.strftime('%Y-%m-%d %H:%M %Z')} - {message}")
     except ValueError:
         await ctx.send("⚠️ Invalid time format! Use HH:MM (24-hour format).")
-
-# ----- Natural Language Reminder Command -----
-@bot.command()
-async def remindme(ctx, *, text: str):
-    """
-    Set a reminder using natural language.
-    Example: !remindme remind me to take a break in 10 minutes
-    The bot will try to parse the time from your message.
-    """
-    # Use dateparser to parse the date/time from the text
-    reminder_datetime = dateparser.parse(
-        text,
-        settings={'TIMEZONE': 'UTC', 'RETURN_AS_TIMEZONE_AWARE': True, 'PREFER_DATES_FROM': 'future'}
-    )
-    if not reminder_datetime:
-        await ctx.send("⚠️ Could not determine the time from your message. Please include a clear time reference.")
-        return
-    user_id = ctx.author.id
-    # Here we use the full natural language text as the reminder message
-    reminders[user_id] = (reminder_datetime, text)
-    await ctx.send(f"⏰ Reminder set for {reminder_datetime.strftime('%Y-%m-%d %H:%M %Z')} - {text}")
 
 # ----- Delete Reminder Command -----
 @bot.command()
 async def delreminder(ctx):
     user_id = ctx.author.id
-    if user_id in reminders:
+    if user_id in reminders and reminders[user_id]:
         del reminders[user_id]
-        await ctx.send("🗑️ Your reminder has been deleted.")
+        await ctx.send("🗑️ Your reminders have been deleted.")
     else:
         await ctx.send("⚠️ You don't have any active reminders.")
 
@@ -199,15 +221,16 @@ async def delreminder(ctx):
 @tasks.loop(seconds=10)
 async def check_reminders():
     now = datetime.now(pytz.utc)
-    to_remove = []
-    for user_id, (reminder_time, message) in reminders.items():
-        if now >= reminder_time:
-            user = await bot.fetch_user(user_id)
-            if user:
-                await user.send(f"🔔 Reminder: {message}")
-            to_remove.append(user_id)
-    for user_id in to_remove:
-        del reminders[user_id]
+    for user_id, reminder_list in list(reminders.items()):
+        remaining = []
+        for reminder_time, message in reminder_list:
+            if now >= reminder_time:
+                user = await bot.fetch_user(user_id)
+                if user:
+                    await user.send(f"🔔 Reminder: {message}")
+            else:
+                remaining.append((reminder_time, message))
+        reminders[user_id] = remaining
 
 # ----- Run the Bot -----
 bot.run(DISCORD_BOT_TOKEN)
