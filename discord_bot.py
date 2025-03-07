@@ -16,7 +16,7 @@ if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
 # Load API keys (replace with your actual keys)
-DISCORD_BOT_TOKEN = ""#enter your own keys
+DISCORD_BOT_TOKEN = ""
 GEMINI_API_KEY = ""
 
 # Configure the Gemini API via the google.generativeai library
@@ -29,10 +29,15 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Dictionaries for storing user time zones, reminders, and AI mode preferences
+# Global conversation history per channel (keep last N messages)
+conversation_history = {}  # { channel_id: list of messages }
+HISTORY_LIMIT = 6  # Adjust number of messages to include in context
+
+# Dictionaries for storing user time zones and reminders
 user_timezones = {}     # { user_id: timezone_str }
 reminders = {}          # { user_id: list of tuples (reminder_datetime, message) }
-user_ai_mode = {}       # { user_id: bool }  (True means auto-AI response enabled)
+# For auto-AI mode per user (optional)
+user_ai_mode = {}       # { user_id: bool }
 
 # ----- Admin Commands -----
 @bot.command()
@@ -53,46 +58,55 @@ async def stop(ctx):
     else:
         await ctx.send("❌ You don't have permission to stop the bot.")
 
-# ----- Basic Test Command -----
+# ----- Active Chat Commands -----
 @bot.command()
 async def hello(ctx):
     await ctx.send("Hello, world! 👋")
 
 # ----- Gemini API Integration -----
-def get_gemini_response(user_input):
+def get_gemini_response(prompt):
     try:
-        response = model.generate_content(user_input)
+        response = model.generate_content(prompt)
         return response.text
     except google.api_core.exceptions.ResourceExhausted:
         return "🚫 I'm out of quota! Please try again later."
     except Exception as e:
         return f"⚠️ Oops! Something went wrong: {str(e)}"
 
-# Function to safely send long responses (splitting into chunks if needed)
+# Function to safely send long responses
 async def send_response(channel, response):
     for i in range(0, len(response), 2000):
         await channel.send(response[i:i+2000])
 
-# ----- Chat Command (with natural language reminder support) -----
-@bot.command()
-async def chat(ctx, *, message: str):
-    """
-    If the message starts with "set reminder", the bot interprets it as a natural language reminder command.
-    It first checks for an explicit "on ... at ..." pattern to extract day, date, and time.
-    Otherwise, it uses search_dates with a proper RELATIVE_BASE to determine the intended reminder time.
-    If no valid datetime is found, it returns an error.
-    Otherwise, it sets the reminder.
-    If the message does not start with "set reminder", it sends the message to the Gemini API.
-    """
-    trigger = "set reminder"
-    if message.lower().startswith(trigger):
-        # Remove trigger phrase
-        reminder_text = message[len(trigger):].strip()
-        user_tz = user_timezones.get(ctx.author.id, "UTC")
+# Helper to update conversation history (store up to HISTORY_LIMIT messages)
+def update_history(channel_id, role, content):
+    if channel_id not in conversation_history:
+        conversation_history[channel_id] = []
+    conversation_history[channel_id].append(f"{role}: {content}")
+    if len(conversation_history[channel_id]) > HISTORY_LIMIT:
+        conversation_history[channel_id] = conversation_history[channel_id][-HISTORY_LIMIT:]
+
+# ----- on_message: Context-Aware Chat and Natural Language Reminders -----
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    # Process commands if message starts with the command prefix
+    if message.content.startswith("!"):
+        await bot.process_commands(message)
+        return
+
+    channel_id = message.channel.id
+
+    # Check if this message is a natural language reminder command
+    if message.content.lower().startswith("set reminder"):
+        reminder_text = message.content[len("set reminder"):].strip()
+        user_tz = user_timezones.get(message.author.id, "UTC")
         relative_base = datetime.now(pytz.timezone(user_tz))
         reminder_datetime = None
 
-        # Check for an explicit "on ... at ..." pattern.
+        # Check for an explicit "on ... at ..." pattern
         explicit_match = re.search(r'on\s+(.+?)\s+at\s+(.+)', reminder_text, re.IGNORECASE)
         if explicit_match:
             date_part = explicit_match.group(1)
@@ -107,7 +121,7 @@ async def chat(ctx, *, message: str):
                     'RELATIVE_BASE': relative_base
                 }
             )
-        # If no explicit pattern, use search_dates.
+        # Otherwise, use search_dates over the text
         if reminder_datetime is None:
             results = search_dates(
                 reminder_text,
@@ -120,7 +134,7 @@ async def chat(ctx, *, message: str):
             )
             if results:
                 reminder_datetime = results[-1][1]
-        # Fallback: manual extraction for "in X minutes/hours"
+        # Fallback: manual extraction
         if reminder_datetime is None:
             match = re.search(r'in\s+(\d+)\s+minutes?', reminder_text, re.IGNORECASE)
             if match:
@@ -132,53 +146,26 @@ async def chat(ctx, *, message: str):
                     hours = int(match.group(1))
                     reminder_datetime = datetime.now(pytz.timezone(user_tz)) + timedelta(hours=hours)
         if reminder_datetime is None:
-            await ctx.send("⚠️ Could not determine a valid time from your reminder text. Please include a clear time reference (e.g., 'in 20 minutes', 'at 3pm', or 'tomorrow at 3:50 pm').")
+            await message.channel.send("⚠️ Could not determine a valid time from your reminder text. Please include a clear time reference (e.g., 'in 20 minutes', 'at 3pm', or 'tomorrow at 3:50 pm').")
             return
-        user_id = ctx.author.id
+
+        user_id = message.author.id
         if user_id not in reminders:
             reminders[user_id] = []
         reminders[user_id].append((reminder_datetime, reminder_text))
-        await ctx.send(f"⏰ Reminder set for {reminder_datetime.strftime('%Y-%m-%d %H:%M %Z')} with message: {reminder_text}")
+        await message.channel.send(f"⏰ Reminder set for {reminder_datetime.strftime('%Y-%m-%d %H:%M %Z')} with message: {reminder_text}")
+        # Optionally update conversation history as context
+        update_history(channel_id, "User", message.content)
+        update_history(channel_id, "Bot", f"Set reminder for {reminder_datetime.strftime('%Y-%m-%d %H:%M %Z')}")
     else:
-        ai_reply = get_gemini_response(message)
-        await send_response(ctx.channel, ai_reply)
-
-# ----- Mode Command (AI vs Normal) -----
-@bot.command()
-async def mode(ctx, mode_type: str):
-    if mode_type.lower() == "ai":
-        user_ai_mode[ctx.author.id] = True
-        await ctx.send("🤖 AI Mode Enabled! The bot will respond to all messages.")
-    elif mode_type.lower() == "normal":
-        user_ai_mode[ctx.author.id] = False
-        await ctx.send("💬 Normal Mode Enabled! The bot will only respond to commands.")
-    else:
-        await ctx.send("⚠️ Invalid mode. Use `!mode ai` or `!mode normal`.")
-
-# ----- Event Listeners -----
-@bot.event
-async def on_ready():
-    print(f'✅ Logged in as {bot.user}')
-    check_reminders.start()
-
-@bot.event
-async def on_member_join(member):
-    # Replace with your actual welcome channel ID
-    welcome_channel_id = 123456789012345678  
-    channel = member.guild.get_channel(welcome_channel_id)
-    if channel:
-        await channel.send(f"Welcome {member.mention} to the server!")
-
-@bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
-    if message.content.startswith("!"):
-        await bot.process_commands(message)
-        return
-    if user_ai_mode.get(message.author.id, False):
-        ai_reply = get_gemini_response(message.content)
+        # Build context prompt from conversation history (if any)
+        history = conversation_history.get(channel_id, [])
+        prompt = "\n".join(history[-HISTORY_LIMIT:]) + f"\nUser: {message.content}\nBot:"
+        ai_reply = get_gemini_response(prompt)
         await send_response(message.channel, ai_reply)
+        # Update conversation history with both user and bot messages
+        update_history(channel_id, "User", message.content)
+        update_history(channel_id, "Bot", ai_reply)
 
 # ----- Poll Command -----
 @bot.command()
@@ -234,8 +221,8 @@ async def remind(ctx, time: str, *, message: str):
 @bot.command()
 async def delreminder(ctx, index: int = None):
     """
-    Deletes a reminder. If an index is provided, deletes that specific reminder.
-    If no index is provided, lists all reminders and asks the user to choose one.
+    Delete a reminder. If an index is provided, delete that specific reminder.
+    If no index is provided, list all reminders and let the user choose which one to delete.
     """
     user_id = ctx.author.id
     if user_id not in reminders or not reminders[user_id]:
@@ -243,7 +230,6 @@ async def delreminder(ctx, index: int = None):
         return
 
     user_reminders = reminders[user_id]
-    # If index is provided and valid, delete that reminder.
     if index is not None:
         if 1 <= index <= len(user_reminders):
             removed = user_reminders.pop(index - 1)
@@ -252,7 +238,6 @@ async def delreminder(ctx, index: int = None):
             await ctx.send("⚠️ Invalid index. Please provide a valid reminder number.")
         return
 
-    # Otherwise, list reminders and ask for a choice.
     response = "Please reply with the number of the reminder you want to delete:\n"
     for i, (rem_time, msg) in enumerate(user_reminders, start=1):
         response += f"{i}. {rem_time.strftime('%Y-%m-%d %H:%M %Z')} - {msg}\n"
