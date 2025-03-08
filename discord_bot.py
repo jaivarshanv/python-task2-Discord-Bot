@@ -17,8 +17,9 @@ if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
 # ----------------- Configuration -----------------
-DISCORD_BOT_TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
+DISCORD_BOT_TOKEN = ""
+GEMINI_API_KEY = ""
+
 
 # Optionally, specify the full path to the FFmpeg executable if not in PATH.
 ffmpeg_executable = os.getenv("FFMPEG_PATH", "ffmpeg")
@@ -233,19 +234,21 @@ async def resume(ctx):
 @bot.command()
 async def queue(ctx):
     guild_id = ctx.guild.id
-    embed = discord.Embed(title="Music Queue", color=discord.Color.blue())
+    description = ""
     voice_client = ctx.guild.voice_client
     if voice_client and voice_client.is_playing() and guild_id in now_playing and now_playing[guild_id]:
         current = now_playing[guild_id]
-        now_field = f"[{current[1]}]({current[0]})"
-        embed.add_field(name="Now Playing", value=truncate(now_field), inline=False)
+        description += f"**Now Playing:** [{current[1]}]({current[0]})\n\n"
     if guild_id in music_queues and music_queues[guild_id]:
-        upcoming = ""
+        description += "**Upcoming Songs:**\n"
         for i, song in enumerate(music_queues[guild_id]):
-            upcoming += f"{i+1}. [{song[1]}]({song[0]})\n"
-        embed.add_field(name="Upcoming Songs", value=truncate(upcoming), inline=False)
-    if not embed.fields:
-        embed.description = "The music queue is empty."
+            description += f"{i+1}. [{song[1]}]({song[0]})\n"
+    if description == "":
+        description = "The music queue is empty."
+    # Truncate description if it exceeds Discord's 2048-character limit for embed descriptions.
+    if len(description) > 2048:
+        description = description[:2045] + "..."
+    embed = discord.Embed(title="Music Queue", description=description, color=discord.Color.blue())
     await ctx.send(embed=embed)
 
 @bot.command()
