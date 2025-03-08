@@ -17,10 +17,11 @@ if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
 # ----------------- Configuration -----------------
-#use your created credentials
 DISCORD_BOT_TOKEN = ""
 GEMINI_API_KEY = ""
 
+# Optionally, specify the full path to the FFmpeg executable if not in PATH.
+ffmpeg_executable = os.getenv("FFMPEG_PATH", "ffmpeg")
 
 # Configure the Gemini API
 genai.configure(api_key=GEMINI_API_KEY)
@@ -41,8 +42,9 @@ user_timezones = {}     # { user_id: timezone_str }
 reminders = {}          # { user_id: list of tuples (reminder_datetime, message) }
 user_ai_mode = {}       # { user_id: bool }
 
-music_queues = {}       # { guild_id: list of song URLs }
-now_playing = {}        # { guild_id: current song URL }
+# For music, we store a tuple (url, title)
+music_queues = {}       # { guild_id: list of tuples (song_url, song_title) }
+now_playing = {}        # { guild_id: tuple (song_url, song_title) }
 
 # ----------------- Helper Functions -----------------
 def get_gemini_response(prompt):
@@ -78,14 +80,22 @@ def search_youtube(query):
                 video = info['entries'][0]
             else:
                 video = info
+            title = video.get('title', 'Unknown Title')
             if 'formats' in video:
                 best_format = max(video['formats'], key=lambda f: f.get('abr') or 0)
-                return best_format['url']
+                url = best_format['url']
             else:
-                return video.get('url')
+                url = video.get('url')
+            return (url, title)
     except Exception as e:
         print(f"Error searching YouTube: {e}")
-        return None
+        return (None, None)
+
+# ----------------- On Ready Event -----------------
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    check_reminders.start()
 
 # ----------------- Admin Commands -----------------
 @bot.command()
@@ -114,9 +124,6 @@ async def hello(ctx):
 # ----------------- Music Commands -----------------
 @bot.command()
 async def play(ctx, *, query: str):
-    """
-    Play a song. If the query is not a URL, search YouTube for it and play the first result.
-    """
     if not ctx.author.voice:
         await ctx.send("You must be in a voice channel to play music.")
         return
@@ -134,17 +141,19 @@ async def play(ctx, *, query: str):
 
     if not re.match(r'https?://', query):
         await ctx.send("Searching YouTube for your song...")
-        url = search_youtube(query)
+        url, title = search_youtube(query)
         if url is None:
             await ctx.send("⚠️ Could not find a matching video on YouTube.")
             return
     else:
         url = query
+        title = query
 
     if guild_id not in music_queues:
         music_queues[guild_id] = []
-    music_queues[guild_id].append(url)
-    await ctx.send(f"Added to queue: {url}")
+    music_queues[guild_id].append((url, title))
+    embed = discord.Embed(description=f"Added to queue: [{title}]({url})", color=discord.Color.green())
+    await ctx.send(embed=embed)
 
     if not voice_client.is_playing():
         await play_next_song(ctx, voice_client)
@@ -155,10 +164,17 @@ async def play_next_song(ctx, voice_client):
         next_song = music_queues[guild_id].pop(0)
         now_playing[guild_id] = next_song
         ffmpeg_options = {
-            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+            'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10',
             'options': '-vn'
         }
-        source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(next_song, **ffmpeg_options))
+        try:
+            source = discord.PCMVolumeTransformer(
+                discord.FFmpegPCMAudio(next_song[0], executable=ffmpeg_executable, **ffmpeg_options)
+            )
+        except Exception as e:
+            await ctx.send(f"Error creating audio source: {e}")
+            return
+
         def after_playing(error):
             if error:
                 print(f"Error playing audio: {error}")
@@ -167,8 +183,10 @@ async def play_next_song(ctx, voice_client):
                 fut.result()
             except Exception as e:
                 print(f"Error in after callback: {e}")
+
         voice_client.play(source, after=after_playing)
-        await ctx.send(f"Now playing: {next_song}")
+        embed = discord.Embed(description=f"Now playing: [{next_song[1]}]({next_song[0]})", color=discord.Color.green())
+        await ctx.send(embed=embed)
     else:
         now_playing[guild_id] = None
         await ctx.send("The music queue is empty.")
@@ -185,29 +203,35 @@ async def skip(ctx):
 @bot.command()
 async def queue(ctx):
     guild_id = ctx.guild.id
-    output = ""
+    embed = discord.Embed(title="Music Queue", color=discord.Color.blue())
     voice_client = ctx.guild.voice_client
     if voice_client and voice_client.is_playing() and guild_id in now_playing and now_playing[guild_id]:
-        output += f"Now Playing: {now_playing[guild_id]}\n"
+        current = now_playing[guild_id]
+        embed.add_field(name="Now Playing", value=f"[{current[1]}]({current[0]})", inline=False)
     if guild_id in music_queues and music_queues[guild_id]:
-        queue_list = "\n".join([f"{i+1}. {song}" for i, song in enumerate(music_queues[guild_id])])
-        output += f"Upcoming Songs:\n{queue_list}"
-    if output == "":
-        output = "The music queue is empty."
-    await ctx.send(output)
+        upcoming = ""
+        for i, song in enumerate(music_queues[guild_id]):
+            upcoming += f"{i+1}. [{song[1]}]({song[0]})\n"
+        if len(upcoming) > 1024:
+            upcoming = upcoming[:1021] + "..."
+        embed.add_field(name="Upcoming Songs", value=upcoming, inline=False)
+    if not embed.fields:
+        embed.description = "The music queue is empty."
+    await ctx.send(embed=embed)
 
 @bot.command()
 async def nowplaying(ctx):
     guild_id = ctx.guild.id
     if guild_id in now_playing and now_playing[guild_id]:
-        await ctx.send(f"Now playing: {now_playing[guild_id]}")
+        song = now_playing[guild_id]
+        await ctx.send(f"Now playing: [{song[1]}]({song[0]})")
     else:
         await ctx.send("No song is currently playing.")
 
 # ----------------- Conversation Context & Task Processing -----------------
 @bot.event
 async def on_message(message):
-    if message.author == bot.user:
+    if message.author.bot:
         return
 
     if message.content.startswith("!"):
@@ -263,6 +287,23 @@ async def on_message(message):
                     'RELATIVE_BASE': relative_base
                 }
             )
+        # Check for seconds first
+        if reminder_datetime is None:
+            match_sec = re.search(r'in\s+(\d+)\s+seconds?', reminder_text, re.IGNORECASE)
+            if match_sec:
+                seconds = int(match_sec.group(1))
+                reminder_datetime = datetime.now(pytz.timezone(user_tz)) + timedelta(seconds=seconds)
+        # Then check for minutes/hours
+        if reminder_datetime is None:
+            match_min = re.search(r'in\s+(\d+)\s+minutes?', reminder_text, re.IGNORECASE)
+            if match_min:
+                minutes = int(match_min.group(1))
+                reminder_datetime = datetime.now(pytz.timezone(user_tz)) + timedelta(minutes=minutes)
+            else:
+                match_hr = re.search(r'in\s+(\d+)\s+hours?', reminder_text, re.IGNORECASE)
+                if match_hr:
+                    hours = int(match_hr.group(1))
+                    reminder_datetime = datetime.now(pytz.timezone(user_tz)) + timedelta(hours=hours)
         if reminder_datetime is None:
             results = search_dates(
                 reminder_text,
@@ -276,25 +317,17 @@ async def on_message(message):
             if results:
                 reminder_datetime = results[-1][1]
         if reminder_datetime is None:
-            match = re.search(r'in\s+(\d+)\s+minutes?', reminder_text, re.IGNORECASE)
-            if match:
-                minutes = int(match.group(1))
-                reminder_datetime = datetime.now(pytz.timezone(user_tz)) + timedelta(minutes=minutes)
-            else:
-                match = re.search(r'in\s+(\d+)\s+hours?', reminder_text, re.IGNORECASE)
-                if match:
-                    hours = int(match.group(1))
-                    reminder_datetime = datetime.now(pytz.timezone(user_tz)) + timedelta(hours=hours)
-        if reminder_datetime is None:
-            await message.channel.send("⚠️ Could not determine a valid time from your reminder text. Please include a clear time reference (e.g., 'in 20 minutes', 'at 3pm', or 'tomorrow at 3:50 pm').")
+            await message.channel.send("⚠️ Could not determine a valid time from your reminder text. Please include a clear time reference (e.g., 'in 20 minutes', 'at 3pm', 'in 15 seconds', or 'tomorrow at 3:50 pm').")
             return
         user_id = message.author.id
         if user_id not in reminders:
             reminders[user_id] = []
+        # Format the time according to the user's timezone, e.g., IST if set.
+        formatted_time = reminder_datetime.strftime('%Y-%m-%d %H:%M:%S %Z')
         reminders[user_id].append((reminder_datetime, reminder_text))
-        await message.channel.send(f"⏰ Reminder set for {reminder_datetime.strftime('%Y-%m-%d %H:%M %Z')} with message: {reminder_text}")
+        await message.channel.send(f"⏰ Reminder set for {formatted_time} with message: {reminder_text}")
         update_history(channel_id, "User", content)
-        update_history(channel_id, "Bot", f"Set reminder for {reminder_datetime.strftime('%Y-%m-%d %H:%M %Z')}")
+        update_history(channel_id, "Bot", f"Set reminder for {formatted_time}")
         return
 
     # Otherwise, process as a regular chat message with context
@@ -324,7 +357,8 @@ async def remind(ctx, time: str, *, message: str):
         if user_id not in reminders:
             reminders[user_id] = []
         reminders[user_id].append((reminder_datetime, message))
-        await ctx.send(f"⏰ Reminder set for {reminder_datetime.strftime('%Y-%m-%d %H:%M %Z')} - {message}")
+        formatted_time = reminder_datetime.strftime('%Y-%m-%d %H:%M:%S %Z')
+        await ctx.send(f"⏰ Reminder set for {formatted_time} - {message}")
     except ValueError:
         await ctx.send("⚠️ Invalid time format! Use HH:MM (24-hour format).")
 
@@ -340,14 +374,15 @@ async def delreminder(ctx, index: int = None):
     if index is not None:
         if 1 <= index <= len(user_reminders):
             removed = user_reminders.pop(index - 1)
-            await ctx.send(f"🗑️ Deleted reminder set for {removed[0].strftime('%Y-%m-%d %H:%M %Z')} - {removed[1]}")
+            formatted_time = removed[0].strftime('%Y-%m-%d %H:%M:%S %Z')
+            await ctx.send(f"🗑️ Deleted reminder set for {formatted_time} - {removed[1]}")
         else:
             await ctx.send("⚠️ Invalid index. Please provide a valid reminder number.")
         return
 
     response = "Please reply with the number of the reminder you want to delete:\n"
     for i, (rem_time, msg) in enumerate(user_reminders, start=1):
-        response += f"{i}. {rem_time.strftime('%Y-%m-%d %H:%M %Z')} - {msg}\n"
+        response += f"{i}. {rem_time.strftime('%Y-%m-%d %H:%M:%S %Z')} - {msg}\n"
     await ctx.send(response)
 
     def check(m):
@@ -358,7 +393,8 @@ async def delreminder(ctx, index: int = None):
         choice = int(reply.content)
         if 1 <= choice <= len(user_reminders):
             removed = user_reminders.pop(choice - 1)
-            await ctx.send(f"🗑️ Deleted reminder set for {removed[0].strftime('%Y-%m-%d %H:%M %Z')} - {removed[1]}")
+            formatted_time = removed[0].strftime('%Y-%m-%d %H:%M:%S %Z')
+            await ctx.send(f"🗑️ Deleted reminder set for {formatted_time} - {removed[1]}")
         else:
             await ctx.send("⚠️ Invalid number. No reminder deleted.")
     except asyncio.TimeoutError:
