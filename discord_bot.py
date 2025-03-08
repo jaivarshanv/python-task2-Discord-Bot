@@ -17,9 +17,8 @@ if sys.stdout.encoding.lower() != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
 # ----------------- Configuration -----------------
-DISCORD_BOT_TOKEN = ""
-GEMINI_API_KEY = ""
-
+DISCORD_BOT_TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
+GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
 
 # Optionally, specify the full path to the FFmpeg executable if not in PATH.
 ffmpeg_executable = os.getenv("FFMPEG_PATH", "ffmpeg")
@@ -92,6 +91,11 @@ def search_youtube(query):
         print(f"Error searching YouTube: {e}")
         return (None, None)
 
+def truncate(text, limit=1024):
+    if len(text) <= limit:
+        return text
+    return text[:limit-3] + "..."
+
 # ----------------- On Ready Event -----------------
 @bot.event
 async def on_ready():
@@ -153,10 +157,11 @@ async def play(ctx, *, query: str):
     if guild_id not in music_queues:
         music_queues[guild_id] = []
     music_queues[guild_id].append((url, title))
-    embed = discord.Embed(description=f"Added to queue: [{title}]({url})", color=discord.Color.green())
+    embed = discord.Embed(
+        description=f"Added to queue: [{title}]({url})", color=discord.Color.green()
+    )
     await ctx.send(embed=embed)
 
-    # If voice client is paused, resume; if not playing, start next song.
     if voice_client.is_paused():
         voice_client.resume()
         await ctx.send("Resumed playback.")
@@ -190,7 +195,9 @@ async def play_next_song(ctx, voice_client):
                 print(f"Error in after callback: {e}")
 
         voice_client.play(source, after=after_playing)
-        embed = discord.Embed(description=f"Now playing: [{next_song[1]}]({next_song[0]})", color=discord.Color.green())
+        embed = discord.Embed(
+            description=f"Now playing: [{next_song[1]}]({next_song[0]})", color=discord.Color.green()
+        )
         await ctx.send(embed=embed)
     else:
         now_playing[guild_id] = None
@@ -230,14 +237,13 @@ async def queue(ctx):
     voice_client = ctx.guild.voice_client
     if voice_client and voice_client.is_playing() and guild_id in now_playing and now_playing[guild_id]:
         current = now_playing[guild_id]
-        embed.add_field(name="Now Playing", value=f"[{current[1]}]({current[0]})", inline=False)
+        now_field = f"[{current[1]}]({current[0]})"
+        embed.add_field(name="Now Playing", value=truncate(now_field), inline=False)
     if guild_id in music_queues and music_queues[guild_id]:
         upcoming = ""
         for i, song in enumerate(music_queues[guild_id]):
             upcoming += f"{i+1}. [{song[1]}]({song[0]})\n"
-        if len(upcoming) > 1024:
-            upcoming = upcoming[:1021] + "..."
-        embed.add_field(name="Upcoming Songs", value=upcoming, inline=False)
+        embed.add_field(name="Upcoming Songs", value=truncate(upcoming), inline=False)
     if not embed.fields:
         embed.description = "The music queue is empty."
     await ctx.send(embed=embed)
@@ -260,7 +266,6 @@ async def skip_to(ctx, index: int):
     voice_client = ctx.guild.voice_client
     if voice_client and voice_client.is_playing():
         voice_client.stop()
-    # Remove songs until we reach the specified one
     for _ in range(index - 1):
         music_queues[guild_id].pop(0)
     await ctx.send(f"Skipping to song number {index} in the queue...")
@@ -271,7 +276,6 @@ async def skip_to(ctx, index: int):
 async def on_message(message):
     if message.author.bot:
         return
-
     if message.content.startswith("!"):
         await bot.process_commands(message)
         return
@@ -279,7 +283,6 @@ async def on_message(message):
     content = message.content.strip()
     channel_id = message.channel.id
 
-    # Natural Language Poll Creation
     if content.lower().startswith("create poll:"):
         pattern = re.compile(r"create poll:\s*(.*?)\s*options:\s*(.*)", re.IGNORECASE)
         match = pattern.search(content)
@@ -304,7 +307,6 @@ async def on_message(message):
             update_history(channel_id, "Bot", f"Created poll: {question}")
             return
 
-    # Natural Language Reminder Processing
     elif content.lower().startswith("set reminder"):
         reminder_text = content[len("set reminder"):].strip()
         user_tz = user_timezones.get(message.author.id, "UTC")
@@ -365,7 +367,6 @@ async def on_message(message):
         update_history(channel_id, "Bot", f"Set reminder for {formatted_time}")
         return
 
-    # Otherwise, process as regular chat with context
     else:
         history = conversation_history.get(channel_id, [])
         prompt = "\n".join(history[-HISTORY_LIMIT:]) + f"\nUser: {content}\nBot:"
@@ -377,7 +378,6 @@ async def on_message(message):
         update_history(channel_id, "User", content)
         update_history(channel_id, "Bot", ai_reply)
 
-# ----------------- Strict Reminder Command -----------------
 @bot.command()
 async def remind(ctx, time: str, *, message: str):
     user_id = ctx.author.id
@@ -397,7 +397,6 @@ async def remind(ctx, time: str, *, message: str):
     except ValueError:
         await ctx.send("⚠️ Invalid time format! Use HH:MM (24-hour format).")
 
-# ----------------- Interactive Delete Reminder Command -----------------
 @bot.command()
 async def delreminder(ctx, index: int = None):
     user_id = ctx.author.id
@@ -437,7 +436,6 @@ async def delreminder(ctx, index: int = None):
     except ValueError:
         await ctx.send("⚠️ Please enter a valid number.")
 
-# ----------------- Time Zone Command -----------------
 @bot.command()
 async def settimezone(ctx, tz: str):
     try:
@@ -447,7 +445,6 @@ async def settimezone(ctx, tz: str):
     except pytz.UnknownTimeZoneError:
         await ctx.send("⚠️ Invalid timezone. Please use a valid timezone name (e.g., `UTC`, `America/New_York`, `Asia/Kolkata`).")
 
-# ----------------- Background Task: Check Reminders -----------------
 @tasks.loop(seconds=1)
 async def check_reminders():
     now = datetime.now(pytz.utc)
@@ -465,5 +462,4 @@ async def check_reminders():
                 remaining.append((reminder_time, message))
         reminders[user_id] = remaining
 
-# ----------------- Run the Bot -----------------
 bot.run(DISCORD_BOT_TOKEN)
