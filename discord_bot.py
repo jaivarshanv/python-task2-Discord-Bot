@@ -20,6 +20,7 @@ if sys.stdout.encoding.lower() != 'utf-8':
 DISCORD_BOT_TOKEN = ""
 GEMINI_API_KEY = ""
 
+
 # Optionally, specify the full path to the FFmpeg executable if not in PATH.
 ffmpeg_executable = os.getenv("FFMPEG_PATH", "ffmpeg")
 
@@ -35,16 +36,16 @@ intents.voice_states = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ----------------- Global Variables -----------------
-conversation_history = {}  # { channel_id: list of strings }
+conversation_history = {}  # {channel_id: list of strings}
 HISTORY_LIMIT = 6
 
-user_timezones = {}     # { user_id: timezone_str }
-reminders = {}          # { user_id: list of tuples (reminder_datetime, message) }
-user_ai_mode = {}       # { user_id: bool }
+user_timezones = {}     # {user_id: timezone_str}
+reminders = {}          # {user_id: list of tuples (reminder_datetime, message)}
+user_ai_mode = {}       # {user_id: bool}
 
-# For music, we store a tuple (url, title)
-music_queues = {}       # { guild_id: list of tuples (song_url, song_title) }
-now_playing = {}        # { guild_id: tuple (song_url, song_title) }
+# For music, we store tuples (song_url, song_title)
+music_queues = {}       # {guild_id: list of tuples (song_url, song_title)}
+now_playing = {}        # {guild_id: tuple (song_url, song_title)}
 
 # ----------------- Helper Functions -----------------
 def get_gemini_response(prompt):
@@ -155,7 +156,11 @@ async def play(ctx, *, query: str):
     embed = discord.Embed(description=f"Added to queue: [{title}]({url})", color=discord.Color.green())
     await ctx.send(embed=embed)
 
-    if not voice_client.is_playing():
+    # If voice client is paused, resume; if not playing, start next song.
+    if voice_client.is_paused():
+        voice_client.resume()
+        await ctx.send("Resumed playback.")
+    elif not voice_client.is_playing():
         await play_next_song(ctx, voice_client)
 
 async def play_next_song(ctx, voice_client):
@@ -201,6 +206,24 @@ async def skip(ctx):
         await ctx.send("No song is currently playing.")
 
 @bot.command()
+async def pause(ctx):
+    voice_client = ctx.guild.voice_client
+    if voice_client and voice_client.is_playing():
+        voice_client.pause()
+        await ctx.send("Paused the current song.")
+    else:
+        await ctx.send("No song is currently playing.")
+
+@bot.command()
+async def resume(ctx):
+    voice_client = ctx.guild.voice_client
+    if voice_client and voice_client.is_paused():
+        voice_client.resume()
+        await ctx.send("Resumed the current song.")
+    else:
+        await ctx.send("The song is not paused or no song is playing.")
+
+@bot.command()
 async def queue(ctx):
     guild_id = ctx.guild.id
     embed = discord.Embed(title="Music Queue", color=discord.Color.blue())
@@ -227,6 +250,21 @@ async def nowplaying(ctx):
         await ctx.send(f"Now playing: [{song[1]}]({song[0]})")
     else:
         await ctx.send("No song is currently playing.")
+
+@bot.command(name="skip_to")
+async def skip_to(ctx, index: int):
+    guild_id = ctx.guild.id
+    if guild_id not in music_queues or index < 1 or index > len(music_queues[guild_id]):
+        await ctx.send("Invalid index. Please provide a valid song number from the queue.")
+        return
+    voice_client = ctx.guild.voice_client
+    if voice_client and voice_client.is_playing():
+        voice_client.stop()
+    # Remove songs until we reach the specified one
+    for _ in range(index - 1):
+        music_queues[guild_id].pop(0)
+    await ctx.send(f"Skipping to song number {index} in the queue...")
+    await play_next_song(ctx, voice_client)
 
 # ----------------- Conversation Context & Task Processing -----------------
 @bot.event
@@ -287,13 +325,11 @@ async def on_message(message):
                     'RELATIVE_BASE': relative_base
                 }
             )
-        # Check for seconds first
         if reminder_datetime is None:
             match_sec = re.search(r'in\s+(\d+)\s+seconds?', reminder_text, re.IGNORECASE)
             if match_sec:
                 seconds = int(match_sec.group(1))
                 reminder_datetime = datetime.now(pytz.timezone(user_tz)) + timedelta(seconds=seconds)
-        # Then check for minutes/hours
         if reminder_datetime is None:
             match_min = re.search(r'in\s+(\d+)\s+minutes?', reminder_text, re.IGNORECASE)
             if match_min:
@@ -322,7 +358,6 @@ async def on_message(message):
         user_id = message.author.id
         if user_id not in reminders:
             reminders[user_id] = []
-        # Format the time according to the user's timezone, e.g., IST if set.
         formatted_time = reminder_datetime.strftime('%Y-%m-%d %H:%M:%S %Z')
         reminders[user_id].append((reminder_datetime, reminder_text))
         await message.channel.send(f"⏰ Reminder set for {formatted_time} with message: {reminder_text}")
@@ -330,7 +365,7 @@ async def on_message(message):
         update_history(channel_id, "Bot", f"Set reminder for {formatted_time}")
         return
 
-    # Otherwise, process as a regular chat message with context
+    # Otherwise, process as regular chat with context
     else:
         history = conversation_history.get(channel_id, [])
         prompt = "\n".join(history[-HISTORY_LIMIT:]) + f"\nUser: {content}\nBot:"
@@ -413,7 +448,7 @@ async def settimezone(ctx, tz: str):
         await ctx.send("⚠️ Invalid timezone. Please use a valid timezone name (e.g., `UTC`, `America/New_York`, `Asia/Kolkata`).")
 
 # ----------------- Background Task: Check Reminders -----------------
-@tasks.loop(seconds=10)
+@tasks.loop(seconds=1)
 async def check_reminders():
     now = datetime.now(pytz.utc)
     for user_id, reminder_list in list(reminders.items()):
@@ -422,7 +457,10 @@ async def check_reminders():
             if now >= reminder_time:
                 user = await bot.fetch_user(user_id)
                 if user:
-                    await user.send(f"🔔 Reminder: {message}")
+                    try:
+                        await user.send(f"🔔 Reminder: {message}")
+                    except Exception as e:
+                        print(f"Failed to send reminder to {user_id}: {e}")
             else:
                 remaining.append((reminder_time, message))
         reminders[user_id] = remaining
